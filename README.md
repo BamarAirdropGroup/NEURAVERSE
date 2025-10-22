@@ -8,6 +8,7 @@ NEURAVERSE SWAP BOT
 
 # Clone the repo
 
+git clone https://github.com/BamarAirdropGroup/NEURAVERSE.git && cd NEURAVERSE && npm install
 
 
 
