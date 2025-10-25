@@ -1,5 +1,6 @@
 const { ethers } = require('ethers');
 const axios = require('axios');
+const fs = require('fs');
 const readline = require('readline');
 const dotenv = require('dotenv');
 
@@ -19,12 +20,13 @@ const logger = {
     banner: () => {
         console.log(`${colors.cyan}${colors.bold}`);
         console.log(`---------------------------------------------`);
-        console.log(`   Neura Bot - ANKR → Random Token Swap   `);
+        console.log(`   Neura Swap Bot V2   `);
         console.log(`---------------------------------------------${colors.reset}\n`);
     },
 };
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+const ask = (rl, q) => new Promise((res) => rl.question(q, res));
 
 const NEURA_RPC = 'https://testnet.rpc.neuraprotocol.io/';
 const CONTRACTS = {
@@ -35,6 +37,7 @@ const ABIS = {
     SWAP_ROUTER: ['function multicall(bytes[] data) payable returns (bytes[] results)'],
     ERC20: [
         'function approve(address spender, uint256 amount) external returns (bool)',
+        'function balanceOf(address account) external view returns (uint256)',
         'function allowance(address owner, address spender) external view returns (uint256)',
         'function decimals() external view returns (uint8)',
     ],
@@ -45,8 +48,8 @@ const abi = ethers.AbiCoder.defaultAbiCoder();
 
 function encodeInnerSwap({ tokenIn, tokenOut, recipient, deadlineMs, amountInWei }) {
     const innerParams = abi.encode(
-        ['address', 'address', 'uint256', 'address', 'uint256', 'uint256', 'uint256', 'uint256'],
-        [tokenIn, tokenOut, 0n, recipient, BigInt(deadlineMs), BigInt(amountInWei), 27n, 0n]
+        ['address','address','uint256','address','uint256','uint256','uint256','uint256'],
+        [ tokenIn, tokenOut, 0n, recipient, BigInt(deadlineMs), BigInt(amountInWei), 27n, 0n ]
     );
     return '0x1679c792' + innerParams.slice(2);
 }
@@ -78,11 +81,11 @@ async function fetchAvailableTokens() {
         }
 
         if (uniqueTokens.has('WANKR')) {
-            uniqueTokens.set('ANKR', { ...uniqueTokens.get('WANKR'), symbol: 'ANKR' });
+             uniqueTokens.set('ANKR', { ...uniqueTokens.get('WANKR'), symbol: 'ANKR' });
         }
 
         logger.success(`Found ${uniqueTokens.size} unique swappable tokens.`);
-        return Array.from(uniqueTokens.values()).sort((a, b) => a.symbol.localeCompare(b.symbol));
+        return Array.from(uniqueTokens.values()).sort((a,b) => a.symbol.localeCompare(b.symbol));
     } catch (e) {
         logger.error(`Failed to fetch tokens: ${e.message}`);
         return [];
@@ -121,14 +124,16 @@ class SwapBot {
                 }
             }
 
-            const deadlineMs = BigInt(Date.now()) + 20n * 60n * 1000n;
+            
+            const deadlineSec = BigInt(Math.floor(Date.now() / 1000)) + 20n * 60n; 
             const tokenInAddressForRouter = isNativeSwapIn ? CONTRACTS.WANKR : tokenIn.address;
+            const tokenOutAddressForRouter = (tokenOut.symbol === 'ANKR') ? CONTRACTS.WANKR : tokenOut.address;
 
             const inner = encodeInnerSwap({
                 tokenIn: tokenInAddressForRouter,
-                tokenOut: tokenOut.address,
+                tokenOut: tokenOutAddressForRouter,
                 recipient: this.address,
-                deadlineMs,
+                deadlineMs: deadlineSec,
                 amountInWei,
             });
             const data = encodeRouterMulticall([inner]);
@@ -145,7 +150,7 @@ class SwapBot {
 
             const rcpt = await tx.wait();
             if (rcpt.status !== 1) throw new Error(`Swap tx reverted on-chain.`);
-            logger.success(`Swap successful: https://testnet.neuraprotocol.io/tx/${rcpt.hash}`);
+            logger.success(`Swap successful: https://testnet-blockscout.infra.neuraprotocol.io/tx/${rcpt.hash}`);
 
         } catch (e) {
             const msg = e?.shortMessage || e?.message || String(e);
@@ -167,6 +172,7 @@ class SwapBot {
                 }
 
                 logger.warn(`Attempt ${i + 1}/${maxRetries} failed: ${message}. Retrying in 10 seconds...`);
+
                 if (i === maxRetries - 1) {
                     logger.error(`Swap failed after ${maxRetries} attempts.`);
                     return false;
@@ -176,10 +182,6 @@ class SwapBot {
         }
         return false;
     }
-}
-
-async function ask(rl, question) {
-    return new Promise((resolve) => rl.question(question, resolve));
 }
 
 async function main() {
@@ -204,64 +206,73 @@ async function main() {
         return;
     }
 
-    const ankrToken = tokens.find(t => t.symbol === 'ANKR');
-    if (!ankrToken) {
-        logger.error('ANKR token not found in fetched tokens.');
+    console.log('\nAvailable tokens:');
+    tokens.forEach((t, i) => console.log(`${i + 1}. ${t.symbol}`));
+
+    const fromIndexStr = await ask(rl, '\nEnter number for the token to swap FROM: ');
+    const toIndexStr = await ask(rl, 'Enter number for the token to swap TO: ');
+    const fromIndex = parseInt(fromIndexStr, 10) - 1;
+    const toIndex = parseInt(toIndexStr, 10) - 1;
+
+    if (isNaN(fromIndex) || isNaN(toIndex) || !tokens[fromIndex] || !tokens[toIndex] || fromIndex === toIndex) {
+        logger.error('Invalid token selection.');
         rl.close();
         return;
     }
 
-    const otherTokens = tokens.filter(t => t.symbol !== 'ANKR');
-    if (!otherTokens.length) {
-        logger.error('No other tokens available to swap ANKR into.');
-        rl.close();
-        return;
-    }
+    const tokenA = tokens[fromIndex];
+    const tokenB = tokens[toIndex];
 
-    const swapAmountStr = await ask(rl, 'Enter amount of ANKR to swap per cycle: ');
-    const repeatsStr = await ask(rl, 'Enter number of swap cycles: ');
-    const repeats = parseInt(repeatsStr, 10) || 1;
-
-    rl.close();
+    const amountAStr = await ask(rl, `Enter amount of ${tokenA.symbol} to swap: `);
+    const repeatStr = await ask(rl, 'How many times to swap? ');
+    const repeats = parseInt(repeatStr, 10) || 1;
 
     for (const pk of pks) {
         const bot = new SwapBot(pk);
-        logger.step(`--- Processing Wallet ${bot.address.slice(0, 10)}... ---`);
+        logger.step(`--- Processing Wallet ${bot.address.slice(0,10)}... ---`);
+        try {
+            for (let j = 0; j < repeats; j++) {
+                logger.step(`--- Swap Cycle ${j+1}/${repeats} ---`);
 
-        for (let j = 0; j < repeats; j++) {
-            let success = false;
-            let attempt = 0;
-            const maxAttempts = otherTokens.length;
+                const swapSuccess = await bot.performSwapWithRetries(tokenA, tokenB, amountAStr);
 
-            while (!success && attempt < maxAttempts) {
-                const randomIndex = Math.floor(Math.random() * otherTokens.length);
-                const randomToken = otherTokens[randomIndex];
+                if (swapSuccess) {
+                    logger.loading('Waiting 10s before swapping back...');
+                    await delay(10000);
 
-                logger.step(`--- Swap Cycle ${j + 1}/${repeats} Attempt ${attempt + 1}: ANKR → ${randomToken.symbol} ---`);
-
-                try {
-                    success = await bot.performSwapWithRetries(ankrToken, randomToken, swapAmountStr, 1);
-                    if (!success) {
-                        logger.warn(`Swap failed, switching to another token...`);
-                        attempt++;
+                    let amountBToSwapStr;
+                    if (tokenB.symbol === 'ANKR') {
+                        const balanceWei = await bot.provider.getBalance(bot.address);
+                        const gasReserve = ethers.parseEther('0.005');
+                        if (balanceWei > gasReserve) {
+                            amountBToSwapStr = ethers.formatEther(balanceWei - gasReserve);
+                        }
+                    } else {
+                        const tokenBContract = new ethers.Contract(tokenB.address, ABIS.ERC20, bot.wallet);
+                        const tokenBBalance = await tokenBContract.balanceOf(bot.address);
+                        if (tokenBBalance > 0n) {
+                            amountBToSwapStr = ethers.formatUnits(tokenBBalance, tokenB.decimals);
+                        }
                     }
-                } catch (e) {
-                    logger.error(`Swap attempt failed: ${e.message}. Trying another token...`);
-                    attempt++;
+
+                    if (amountBToSwapStr) {
+                        await bot.performSwapWithRetries(tokenB, tokenA, amountBToSwapStr);
+                    } else {
+                        logger.warn(`No ${tokenB.symbol} balance found to swap back. Skipping reverse swap.`);
+                    }
+                } else {
+                    logger.warn(`Skipping reverse swap because the initial swap from ${tokenA.symbol} to ${tokenB.symbol} failed.`);
                 }
-            }
 
-            if (!success) {
-                logger.error(`All swap attempts failed for wallet ${bot.address.slice(0, 10)} in cycle ${j + 1}.`);
-            } else {
-                logger.success(`Swap cycle ${j + 1} completed successfully for wallet ${bot.address.slice(0, 10)}.`);
+                logger.loading('Waiting 10s before next wallet/cycle...');
+                await delay(10000);
             }
-
-            logger.loading('Waiting 10s before next cycle...');
-            await delay(10000);
+        } catch (e) {
+            logger.error(`Swap flow failed for wallet ${bot.address}: ${e.message}`);
         }
     }
 
+    rl.close();
     logger.success('All swap tasks completed.');
 }
 
